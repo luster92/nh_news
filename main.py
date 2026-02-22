@@ -20,7 +20,7 @@ logger = logging.getLogger("NH_News_Logger")
 logger.setLevel(logging.INFO)
 
 # Create a handler that rotates logs every day at midnight, keeping 7 days of logs
-handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=7, encoding='utf-8')
+handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=3, encoding='utf-8')
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -64,23 +64,35 @@ else:
     model = None
 
 def get_sent_history():
-    """Parses the log file to get titles of articles sent TODAY."""
+    """Parses the log files to get titles of articles sent in the last 3 days."""
     sent_titles = []
-    if not os.path.exists(LOG_FILE):
-        return sent_titles
     
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    # 최근 3일치 날짜 문자열 생성
+    date_prefixes = [
+        (datetime.datetime.now() - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(3)
+    ]
     
-    try:
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.startswith(today_str) and "Sending message for:" in line:
-                    parts = line.split("Sending message for: ")
-                    if len(parts) > 1:
-                        title = parts[1].strip()
-                        sent_titles.append(title)
-    except Exception as e:
-        logger.error(f"Error reading log history: {e}")
+    # 현재 로그 + 로테이션된 로그 파일 목록
+    log_files = [LOG_FILE]
+    for i in range(1, 4):
+        rotated = f"{LOG_FILE}.{(datetime.datetime.now() - datetime.timedelta(days=i)).strftime('%Y-%m-%d')}"
+        if os.path.exists(rotated):
+            log_files.append(rotated)
+    
+    for log_path in log_files:
+        if not os.path.exists(log_path):
+            continue
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if any(line.startswith(d) for d in date_prefixes) and "Sending message for:" in line:
+                        parts = line.split("Sending message for: ")
+                        if len(parts) > 1:
+                            title = parts[1].strip()
+                            sent_titles.append(title)
+        except Exception as e:
+            logger.error(f"Error reading log history from {log_path}: {e}")
     
     return sent_titles
 
@@ -123,7 +135,7 @@ def fetch_news():
     filtered_articles = []
     
     current_time = datetime.datetime.now(datetime.timezone.utc)
-    time_limit = datetime.timedelta(hours=3)
+    time_limit = datetime.timedelta(hours=24)
 
     logger.info(f"Fetching news from: {RSS_URL}")
     logger.info(f"Found {len(feed.entries)} entries.")
