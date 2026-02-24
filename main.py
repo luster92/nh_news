@@ -67,6 +67,13 @@ MEDIUM_IMPORTANCE_KEYWORDS = [
     "서비스", "이벤트", "프로모션", "교육", "봉사", "사회공헌"
 ]
 
+LOW_CATEGORY_RULES = {
+    "사회공헌": ["봉사", "기부", "사회공헌", "상생", "나눔", "헌혈"],
+    "상품/서비스": ["출시", "서비스", "플랫폼", "앱", "대출", "예금", "적금"],
+    "마케팅/행사": ["이벤트", "캠페인", "프로모션", "행사", "페스티벌", "홍보"],
+    "조직/교육": ["교육", "연수", "워크숍", "채용", "인사", "발대식"]
+}
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -511,24 +518,52 @@ def format_message(article):
     )
     return message
 
+def classify_low_category(title: str) -> str:
+    normalized = title.lower()
+    for category, keywords in LOW_CATEGORY_RULES.items():
+        for kw in keywords:
+            if kw.lower() in normalized:
+                return category
+    return "기타"
+
+
 def format_low_digest(articles):
-    """Format low-importance articles as one merged digest message."""
+    """Format low-importance articles as one merged digest message grouped by category."""
     if not articles:
         return None
 
-    lines = ["⚪ **낮은 중요도 뉴스 묶음 요약**"]
+    grouped = {}
+    for article in articles:
+        category = classify_low_category(article.get("title", ""))
+        grouped.setdefault(category, []).append(article)
 
-    for idx, article in enumerate(articles[:10], 1):
-        published = article['published']
-        if published.tzinfo is None:
-            published = published.replace(tzinfo=datetime.timezone.utc)
-        kst_time = published.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
-        date_str = kst_time.strftime("%m-%d %H:%M")
-        lines.append(f"{idx}. {article['title']} ({date_str})")
-        lines.append(f"   🔗 {article['link']}")
+    lines = ["⚪ **낮은 중요도 뉴스 일일 요약 (18:00 KST)**"]
+    shown = 0
+    max_items = 12
 
-    if len(articles) > 10:
-        lines.append(f"…외 {len(articles) - 10}건")
+    for category in ["사회공헌", "상품/서비스", "마케팅/행사", "조직/교육", "기타"]:
+        items = grouped.get(category, [])
+        if not items:
+            continue
+
+        lines.append(f"\n• **{category}**")
+        for article in items:
+            if shown >= max_items:
+                break
+            published = article['published']
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=datetime.timezone.utc)
+            kst_time = published.astimezone(KST)
+            date_str = kst_time.strftime("%m-%d %H:%M")
+            lines.append(f"- {article['title']} ({date_str})")
+            lines.append(f"  🔗 {article['link']}")
+            shown += 1
+
+        if shown >= max_items:
+            break
+
+    if len(articles) > shown:
+        lines.append(f"\n…외 {len(articles) - shown}건")
 
     return "\n".join(lines)
 
