@@ -148,7 +148,7 @@ def send_telegram_reply(chat_id, message):
 
 
 def process_subscriber_commands():
-    """Process /start, /subscribe, /unsubscribe commands via Telegram getUpdates."""
+    """Process /start, /help, /subscribe, /unsubscribe commands via Telegram getUpdates."""
     if not TELEGRAM_BOT_TOKEN:
         return
 
@@ -199,6 +199,19 @@ def process_subscriber_commands():
             )
             logger.info(f"Subscriber added: {chat_id_str}")
 
+        elif text.startswith("/help"):
+            send_telegram_reply(
+                chat_id,
+                "📌 NH_news 명령어 안내\n"
+                "/start 또는 /subscribe : 뉴스 구독 시작\n"
+                "/unsubscribe : 뉴스 구독 해제\n"
+                "/help : 명령어 안내 보기\n\n"
+                "알림 정책:\n"
+                "- 🔴/🟡 중요 뉴스는 개별 알림\n"
+                "- ⚪ 낮은 중요도 뉴스는 묶음 요약으로 발송"
+            )
+            logger.info(f"Help requested: {chat_id_str}")
+
         elif text.startswith("/unsubscribe"):
             if chat_id_str in subscribers:
                 subscribers.remove(chat_id_str)
@@ -232,8 +245,8 @@ def get_sent_history():
         try:
             with open(log_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    if any(line.startswith(d) for d in date_prefixes) and "Sending message for:" in line:
-                        parts = line.split("Sending message for: ")
+                    if any(line.startswith(d) for d in date_prefixes) and "message for:" in line:
+                        parts = line.split("message for: ")
                         if len(parts) > 1:
                             title = parts[1].strip()
                             sent_titles.append(title)
@@ -410,6 +423,28 @@ def format_message(article):
     )
     return message
 
+def format_low_digest(articles):
+    """Format low-importance articles as one merged digest message."""
+    if not articles:
+        return None
+
+    lines = ["⚪ **낮은 중요도 뉴스 묶음 요약**"]
+
+    for idx, article in enumerate(articles[:10], 1):
+        published = article['published']
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=datetime.timezone.utc)
+        kst_time = published.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+        date_str = kst_time.strftime("%m-%d %H:%M")
+        lines.append(f"{idx}. {article['title']} ({date_str})")
+        lines.append(f"   🔗 {article['link']}")
+
+    if len(articles) > 10:
+        lines.append(f"…외 {len(articles) - 10}건")
+
+    return "\n".join(lines)
+
+
 def send_telegram_message(message):
     """Broadcast message to all subscribers."""
     if not TELEGRAM_BOT_TOKEN:
@@ -445,20 +480,36 @@ def run_news_cycle():
 
     match_count = 0
     sent_stats = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    low_bucket = []
 
     for article in articles:
         if is_duplicate(article['title'], sent_history):
             continue
 
+        importance = article.get('importance', 'LOW')
+
+        if importance == 'LOW':
+            low_bucket.append(article)
+            sent_history.append(article['title'])
+            match_count += 1
+            sent_stats['LOW'] += 1
+            continue
+
         message = format_message(article)
         logger.info(
-            f"Sending [{article.get('importance', 'LOW')}] message for: {article['title']}"
+            f"Sending [{importance}] message for: {article['title']}"
         )
         send_telegram_message(message)
 
         sent_history.append(article['title'])
         match_count += 1
-        sent_stats[article.get('importance', 'LOW')] = sent_stats.get(article.get('importance', 'LOW'), 0) + 1
+        sent_stats[importance] = sent_stats.get(importance, 0) + 1
+
+    if low_bucket:
+        digest = format_low_digest(low_bucket)
+        if digest:
+            logger.info(f"Sending [LOW-DIGEST] merged message for {len(low_bucket)} low-importance articles.")
+            send_telegram_message(digest)
 
     logger.info(
         f"Cycle finished. Sent {match_count} new articles "
