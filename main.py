@@ -2,9 +2,11 @@
 import feedparser
 import requests
 import os
+import json
 import datetime
 import logging
 import argparse
+import threading
 import time
 from logging.handlers import TimedRotatingFileHandler
 from dateutil import parser
@@ -19,7 +21,7 @@ LOG_FILE = "nh_news.log"
 logger = logging.getLogger("NH_News_Logger")
 logger.setLevel(logging.INFO)
 
-# Create a handler that rotates logs every day at midnight, keeping 7 days of logs
+# Create a handler that rotates logs every day at midnight, keeping 3 days of logs
 handler = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=3, encoding='utf-8')
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -37,31 +39,175 @@ TARGET_MEDIA = [
     # 주요 일간지 (전국종합지)
     "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문",
     "한국일보", "서울신문", "국민일보", "세계일보", "문화일보",
-    
+
     # 지상파 및 종합편성/보도전문 채널
     "KBS", "MBC", "SBS", "JTBC", "YTN",
     "연합뉴스TV", "MBN", "TV조선", "채널A",
-    
+
     # 뉴스통신사
     "연합뉴스", "뉴시스", "뉴스1",
-    
+
     # 경제 전문지
-    "매일경제", "한국경제", "서울경제", "머니투데이", "파이낸셜뉴스", "이데일리",
-    
+    "매일경제", "한국경제", "서울경제", "머니투데이", "파이낸셜뉴스", "이데일리", "헤럴드경제",
+
     # 신뢰도/비평/기타
     "노컷뉴스", "시사IN"
+]
+
+# 중요도 분류 키워드 (제목 기반 룰)
+HIGH_IMPORTANCE_KEYWORDS = [
+    "회장", "행장", "이사회", "국정감사", "감사", "검찰", "금감원", "금융위원회", "한국은행",
+    "정책", "규제", "제재", "징계", "리스크", "부실", "횡령", "배임", "수사", "압수수색",
+    "실적", "분기", "결산", "자본", "건전성", "연체", "충당금", "구조조정", "매각", "인수",
+    "전략", "MOU", "신사업", "디지털전환", "노사", "파업"
+]
+
+MEDIUM_IMPORTANCE_KEYWORDS = [
+    "출시", "확대", "협약", "업무협약", "캠페인", "지원", "대출", "예금", "적금", "플랫폼",
+    "서비스", "이벤트", "프로모션", "교육", "봉사", "사회공헌"
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SUBSCRIBERS_FILE = "subscribers.json"
+TELEGRAM_STATE_FILE = "telegram_state.json"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Using gemini-3-flash-preview as requested
+    model = genai.GenerativeModel('gemini-3-flash-preview')
 else:
-    logger.warning("GEMINI_API_KEY not found. Deduplication will be disabled.")
+    logger.warning("GEMINI_API_KEY not found. Deduplication will be limited to exact matches.")
     model = None
+
+
+def load_subscribers():
+    """Load subscriber chat IDs from disk."""
+    subscribers = set()
+
+    # Seed with primary chat id from env for backward compatibility
+    if TELEGRAM_CHAT_ID:
+        subscribers.add(str(TELEGRAM_CHAT_ID))
+
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return subscribers
+
+    try:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for cid in data.get("chat_ids", []):
+                subscribers.add(str(cid))
+    except Exception as e:
+        logger.error(f"Failed to load subscribers: {e}")
+
+    return subscribers
+
+
+def save_subscribers(subscribers):
+    """Persist subscriber chat IDs to disk."""
+    try:
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chat_ids": sorted(list(subscribers))}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save subscribers: {e}")
+
+
+def load_telegram_state():
+    if not os.path.exists(TELEGRAM_STATE_FILE):
+        return {"last_update_id": 0}
+    try:
+        with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load telegram state: {e}")
+        return {"last_update_id": 0}
+
+
+def save_telegram_state(state):
+    try:
+        with open(TELEGRAM_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save telegram state: {e}")
+
+
+def send_telegram_reply(chat_id, message):
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("Error: TELEGRAM_BOT_TOKEN not found in .env")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending command reply to {chat_id}: {e}")
+
+
+def process_subscriber_commands():
+    """Process /start, /subscribe, /unsubscribe commands via Telegram getUpdates."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    state = load_telegram_state()
+    last_update_id = int(state.get("last_update_id", 0))
+    subscribers = load_subscribers()
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 1, "allowed_updates": ["message"]}
+
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error polling Telegram updates: {e}")
+        return
+
+    if not payload.get("ok"):
+        logger.error(f"Telegram getUpdates returned not ok: {payload}")
+        return
+
+    updates = payload.get("result", [])
+    if not updates:
+        return
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        if update_id > last_update_id:
+            last_update_id = update_id
+
+        msg = update.get("message", {})
+        chat = msg.get("chat", {})
+        chat_id = chat.get("id")
+        text = (msg.get("text") or "").strip().lower()
+
+        if not chat_id or not text.startswith("/"):
+            continue
+
+        chat_id_str = str(chat_id)
+
+        if text.startswith("/start") or text.startswith("/subscribe"):
+            subscribers.add(chat_id_str)
+            save_subscribers(subscribers)
+            send_telegram_reply(
+                chat_id,
+                "✅ NH_news 구독이 시작되었습니다.\n이제 농협은행 관련 뉴스를 받아보실 수 있습니다.\n중단하려면 /unsubscribe 를 입력하세요."
+            )
+            logger.info(f"Subscriber added: {chat_id_str}")
+
+        elif text.startswith("/unsubscribe"):
+            if chat_id_str in subscribers:
+                subscribers.remove(chat_id_str)
+                save_subscribers(subscribers)
+            send_telegram_reply(chat_id, "🛑 NH_news 구독이 해제되었습니다. 다시 시작하려면 /start")
+            logger.info(f"Subscriber removed: {chat_id_str}")
+
+    save_telegram_state({"last_update_id": last_update_id})
+
 
 def get_sent_history():
     """Parses the log files to get titles of articles sent in the last 3 days."""
@@ -94,46 +240,94 @@ def get_sent_history():
         except Exception as e:
             logger.error(f"Error reading log history from {log_path}: {e}")
     
-    return sent_titles
+    return list(set(sent_titles)) # Remove duplicates within history
 
 def is_duplicate(new_title, history_titles):
-    """Checks if the new title is a duplicate of any title in history using Gemini."""
-    if not model or not history_titles:
+    """Checks if the new title is a duplicate of any title in history."""
+    if not history_titles:
         return False
 
+    # 1. Exact match check (fast)
     if new_title in history_titles:
         return True
 
-    recent_history = history_titles[-50:]
+    # 2. Basic word-level similarity check (Jaccard-ish)
+    # This acts as a robust fallback for similar titles (e.g. different source suffixes)
+    # "NH농협은행, 개편 - 뉴스" vs "NH농협은행, 개편 - 서울경제"
+    new_clean = new_title.split(" - ")[0].strip() # Strip source suffix if present
+    new_words = set(new_clean.split())
+    
+    for h_title in history_titles:
+        h_clean = h_title.split(" - ")[0].strip()
+        h_words = set(h_clean.split())
+        
+        if not h_words or not new_words:
+            continue
+            
+        intersection = new_words.intersection(h_words)
+        union = new_words.union(h_words)
+        similarity = len(intersection) / len(union)
+        
+        # If words match > 80%, consider it a duplicate regardless of AI
+        if similarity > 0.8:
+            logger.info(f"Deduplicated by string similarity ({similarity:.2f}): '{new_title}' matches '{h_title}'")
+            return True
+
+    if not model:
+        return False
+
+    # 3. Gemini AI check for semantic duplication
+    recent_history = history_titles[-30:] # Last 30 titles for context
     
     prompt = f"""
-    Here is a new news title: '{new_title}'
+    New news title: '{new_title}'
     
-    Here is a list of news titles that have already been sent:
+    Sent titles history:
     {recent_history}
     
-    Does the new news title report the EXACT SAME event/story as any of the sent titles?
-    If it's just a similar topic but a different specific report or angle, it's NOT a duplicate.
-    If it's covering the same breaking news or press release, it IS a duplicate.
+    Does the 'New news title' report the EXACT SAME event or story as any title in the history?
+    Common case: different media reporting the same press release or breaking news.
+    If it's the same event, answer YES.
+    If it's a different event or a follow-up with significant new info, answer NO.
     
-    Answer only YES or NO.
+    Answer ONLY 'YES' or 'NO'.
     """
     
     try:
         response = model.generate_content(prompt)
         answer = response.text.strip().upper()
         if "YES" in answer:
+            logger.info(f"Deduplicated by Gemini: '{new_title}'")
             return True
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini API error (model: {model.model_name}): {e}")
         
     return False
+
+def classify_importance(title: str):
+    """Classify article importance using lightweight keyword rules."""
+    normalized = title.lower()
+
+    for kw in HIGH_IMPORTANCE_KEYWORDS:
+        if kw.lower() in normalized:
+            return "HIGH", f"키워드:{kw}"
+
+    for kw in MEDIUM_IMPORTANCE_KEYWORDS:
+        if kw.lower() in normalized:
+            return "MEDIUM", f"키워드:{kw}"
+
+    return "LOW", "일반 동향"
+
+
+def importance_rank(level: str) -> int:
+    return {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(level, 2)
+
 
 def fetch_news():
     """Fetches news from Google RSS and filters by media and time."""
     feed = feedparser.parse(RSS_URL)
     filtered_articles = []
-    
+
     current_time = datetime.datetime.now(datetime.timezone.utc)
     time_limit = datetime.timedelta(hours=24)
 
@@ -163,89 +357,164 @@ def fetch_news():
                  break
         
         if not is_target_media:
-            logger.info(f"Skipped (Source mismatch): [{source}] {title}")
+            # logger.info(f"Skipped (Source mismatch): [{source}] {title}")
             continue
+
+        importance, reason = classify_importance(title)
 
         filtered_articles.append({
             'title': title,
             'link': link,
             'published': published_dt,
-            'source': source
+            'source': source,
+            'importance': importance,
+            'importance_reason': reason
         })
+
+    # 중요한 뉴스 먼저 처리
+    filtered_articles.sort(
+        key=lambda a: (importance_rank(a.get('importance', 'LOW')), a['published']),
+        reverse=False
+    )
 
     return filtered_articles
 
 def format_message(article):
     """Formats the article into a Telegram message."""
     title = article['title']
-    date_str = article['published'].strftime("%y-%m-%d %H:%M")
+
+    # Convert to KST safely
+    published = article['published']
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=datetime.timezone.utc)
+    kst_time = published.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+
+    # Use YYYY-MM-DD format for clarity
+    date_str = kst_time.strftime("%Y-%m-%d %H:%M")
+
+    importance = article.get('importance', 'LOW')
+    reason = article.get('importance_reason', '일반 동향')
+    badge_map = {
+        'HIGH': '🔴 중요도: 높음',
+        'MEDIUM': '🟡 중요도: 중간',
+        'LOW': '⚪ 중요도: 낮음'
+    }
+    importance_line = badge_map.get(importance, '⚪ 중요도: 낮음')
+
     link = article['link']
     message = (
         f"📢 **{title}**\n"
-        f"🕒 {date_str}\n\n"
+        f"{importance_line} ({reason})\n"
+        f"🕒 {date_str} (KST)\n\n"
         f"🔗 [기사원문 읽기]({link})"
     )
     return message
 
 def send_telegram_message(message):
-    """Sends a message to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env")
+    """Broadcast message to all subscribers."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("Error: TELEGRAM_BOT_TOKEN not found in .env")
+        return
+
+    subscribers = load_subscribers()
+    if not subscribers:
+        logger.warning("No subscribers found. Skipping broadcast.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        logger.info("Message sent successfully.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error sending message: {e}")
+    success = 0
+    for chat_id in subscribers:
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        try:
+            response = requests.post(url, json=payload, timeout=15)
+            response.raise_for_status()
+            success += 1
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error sending message to {chat_id}: {e}")
 
-def run_cycle():
+    logger.info(f"Message broadcast complete. Success: {success}/{len(subscribers)}")
+
+def run_news_cycle():
     logger.info("Starting news fetch cycle.")
-    logger.info(f"Current time (UTC): {datetime.datetime.now(datetime.timezone.utc)}")
-    
+
     sent_history = get_sent_history()
     logger.info(f"Loaded {len(sent_history)} sent articles from history.")
-    
+
     articles = fetch_news()
     logger.info(f"Found {len(articles)} candidate articles after basic filtering.")
-    
+
     match_count = 0
+    sent_stats = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+
     for article in articles:
         if is_duplicate(article['title'], sent_history):
-            logger.info(f"Skipped (Duplicate): {article['title']}")
             continue
-            
+
         message = format_message(article)
-        logger.info(f"Sending message for: {article['title']}")
+        logger.info(
+            f"Sending [{article.get('importance', 'LOW')}] message for: {article['title']}"
+        )
         send_telegram_message(message)
-        
+
         sent_history.append(article['title'])
         match_count += 1
-    
-    logger.info(f"Cycle finished. Sent {match_count} new articles.")
+        sent_stats[article.get('importance', 'LOW')] = sent_stats.get(article.get('importance', 'LOW'), 0) + 1
+
+    logger.info(
+        f"Cycle finished. Sent {match_count} new articles "
+        f"(HIGH={sent_stats.get('HIGH', 0)}, MEDIUM={sent_stats.get('MEDIUM', 0)}, LOW={sent_stats.get('LOW', 0)})."
+    )
+
+
+def run_news_loop(interval_minutes: int):
+    logger.info(f"News loop started. Interval: {interval_minutes} minutes.")
+    while True:
+        try:
+            run_news_cycle()
+        except Exception as e:
+            logger.error(f"Unexpected error in news loop: {e}")
+
+        logger.info(f"[News Loop] Sleeping for {interval_minutes} minutes...")
+        time.sleep(interval_minutes * 60)
+
+
+def run_command_loop(interval_seconds: int):
+    logger.info(f"Command loop started. Poll interval: {interval_seconds} seconds.")
+    while True:
+        try:
+            process_subscriber_commands()
+        except Exception as e:
+            logger.error(f"Unexpected error in command loop: {e}")
+
+        time.sleep(interval_seconds)
 
 def main():
     parser = argparse.ArgumentParser(description="NH News Crawler Daemon")
-    parser.add_argument("--loop", action="store_true", help="Run in a continuous loop")
-    parser.add_argument("--interval", type=int, default=10, help="Wait interval in minutes (default: 10)")
+    parser.add_argument("--loop", action="store_true", help="Run in continuous loops")
+    parser.add_argument("--interval", type=int, default=10, help="News loop interval in minutes (default: 10)")
+    parser.add_argument("--command-interval", type=int, default=30, help="Command poll interval in seconds (default: 30)")
     args = parser.parse_args()
 
     if args.loop:
-        logger.info(f"Starting in LOOP mode. Interval: {args.interval} minutes.")
-        while True:
-            try:
-                run_cycle()
-            except Exception as e:
-                logger.error(f"Unexpected error in loop: {e}")
-            
-            logger.info(f"Sleeping for {args.interval} minutes...")
-            time.sleep(args.interval * 60)
+        logger.info(
+            f"Starting split LOOP mode. news_interval={args.interval}m, "
+            f"command_interval={args.command_interval}s"
+        )
+
+        command_thread = threading.Thread(
+            target=run_command_loop,
+            args=(args.command_interval,),
+            daemon=True,
+            name="telegram-command-loop"
+        )
+        command_thread.start()
+
+        # Run news loop in main thread
+        run_news_loop(args.interval)
     else:
-        run_cycle()
+        # One-shot execution for manual tests
+        process_subscriber_commands()
+        run_news_cycle()
 
 if __name__ == "__main__":
     main()
