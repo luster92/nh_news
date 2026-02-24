@@ -197,7 +197,8 @@ def enqueue_low_articles(articles):
         queue_data["items"].append({
             "title": article.get("title"),
             "link": article.get("link"),
-            "published": published.isoformat()
+            "published": published.isoformat(),
+            "importance": article.get("importance", "LOW")
         })
         existing_links.add(article.get("link"))
 
@@ -229,7 +230,8 @@ def flush_low_digest_if_due():
         digest_articles.append({
             "title": item.get("title", "(제목 없음)"),
             "link": item.get("link", ""),
-            "published": published_dt
+            "published": published_dt,
+            "importance": item.get("importance", "LOW")
         })
 
     digest_message = format_low_digest(digest_articles)
@@ -302,8 +304,8 @@ def process_subscriber_commands():
                 "/unsubscribe : 뉴스 구독 해제\n"
                 "/help : 명령어 안내 보기\n\n"
                 "알림 정책:\n"
-                "- 🔴/🟡 중요 뉴스는 개별 알림\n"
-                "- ⚪ 낮은 중요도 뉴스는 매일 18:00(KST) 묶음 요약 발송"
+                "- 🔴 높은 중요도 뉴스는 개별 알림 (최근 2시간 이내)\n"
+                "- 🟡/⚪ 중간·낮은 중요도 뉴스는 매일 18:00(KST) 묶음 요약 발송"
             )
             logger.info(f"Help requested: {chat_id_str}")
 
@@ -437,7 +439,8 @@ def fetch_news():
     filtered_articles = []
 
     current_time = datetime.datetime.now(datetime.timezone.utc)
-    time_limit = datetime.timedelta(hours=24)
+    default_time_limit = datetime.timedelta(hours=24)
+    high_time_limit = datetime.timedelta(hours=2)  # 갑각마스터님 요청: HIGH는 2시간 이내만
 
     logger.info(f"Fetching news from: {RSS_URL}")
     logger.info(f"Found {len(feed.entries)} entries.")
@@ -447,15 +450,11 @@ def fetch_news():
         link = entry.link
         published = entry.published
         source = entry.source.title if 'source' in entry else ""
-        
+
         try:
             published_dt = parser.parse(published)
         except Exception as e:
             logger.error(f"Error parsing date {published}: {e}")
-            continue
-
-        time_diff = current_time - published_dt
-        if time_diff > time_limit:
             continue
 
         is_target_media = False
@@ -463,12 +462,19 @@ def fetch_news():
              if media in source:
                  is_target_media = True
                  break
-        
+
         if not is_target_media:
             # logger.info(f"Skipped (Source mismatch): [{source}] {title}")
             continue
 
         importance, reason = classify_importance(title)
+
+        time_diff = current_time - published_dt
+        if importance == "HIGH":
+            if time_diff > high_time_limit:
+                continue
+        elif time_diff > default_time_limit:
+            continue
 
         filtered_articles.append({
             'title': title,
@@ -537,7 +543,7 @@ def format_low_digest(articles):
         category = classify_low_category(article.get("title", ""))
         grouped.setdefault(category, []).append(article)
 
-    lines = ["⚪ **낮은 중요도 뉴스 일일 요약 (18:00 KST)**"]
+    lines = ["🗂️ **중간/낮은 중요도 뉴스 일일 요약 (18:00 KST)**"]
     shown = 0
     max_items = 12
 
@@ -555,7 +561,9 @@ def format_low_digest(articles):
                 published = published.replace(tzinfo=datetime.timezone.utc)
             kst_time = published.astimezone(KST)
             date_str = kst_time.strftime("%m-%d %H:%M")
-            lines.append(f"- {article['title']} ({date_str})")
+            imp = article.get("importance", "LOW")
+            imp_badge = "🟡" if imp == "MEDIUM" else "⚪"
+            lines.append(f"- {imp_badge} {article['title']} ({date_str})")
             lines.append(f"  🔗 {article['link']}")
             shown += 1
 
@@ -611,11 +619,11 @@ def run_news_cycle():
 
         importance = article.get('importance', 'LOW')
 
-        if importance == 'LOW':
+        if importance in ('MEDIUM', 'LOW'):
             low_bucket.append(article)
             sent_history.append(article['title'])
             match_count += 1
-            sent_stats['LOW'] += 1
+            sent_stats[importance] = sent_stats.get(importance, 0) + 1
             continue
 
         message = format_message(article)
@@ -630,7 +638,7 @@ def run_news_cycle():
 
     if low_bucket:
         enqueue_low_articles(low_bucket)
-        logger.info(f"Queued {len(low_bucket)} low-importance articles for 18:00 KST digest.")
+        logger.info(f"Queued {len(low_bucket)} MEDIUM/LOW articles for 18:00 KST digest.")
 
     flush_low_digest_if_due()
 
