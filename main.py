@@ -72,6 +72,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUBSCRIBERS_FILE = "subscribers.json"
 TELEGRAM_STATE_FILE = "telegram_state.json"
+LOW_QUEUE_FILE = "low_importance_queue.json"
+KST = datetime.timezone(datetime.timedelta(hours=9))
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -147,6 +149,92 @@ def send_telegram_reply(chat_id, message):
         logger.error(f"Error sending command reply to {chat_id}: {e}")
 
 
+def load_low_queue():
+    if not os.path.exists(LOW_QUEUE_FILE):
+        return {"items": [], "last_digest_date": None}
+    try:
+        with open(LOW_QUEUE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return {
+                "items": data.get("items", []),
+                "last_digest_date": data.get("last_digest_date")
+            }
+    except Exception as e:
+        logger.error(f"Failed to load low queue: {e}")
+        return {"items": [], "last_digest_date": None}
+
+
+def save_low_queue(queue_data):
+    try:
+        with open(LOW_QUEUE_FILE, "w", encoding="utf-8") as f:
+            json.dump(queue_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save low queue: {e}")
+
+
+def enqueue_low_articles(articles):
+    if not articles:
+        return
+
+    queue_data = load_low_queue()
+    existing_links = {item.get("link") for item in queue_data.get("items", [])}
+
+    for article in articles:
+        if article.get("link") in existing_links:
+            continue
+
+        published = article['published']
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=datetime.timezone.utc)
+
+        queue_data["items"].append({
+            "title": article.get("title"),
+            "link": article.get("link"),
+            "published": published.isoformat()
+        })
+        existing_links.add(article.get("link"))
+
+    save_low_queue(queue_data)
+
+
+def flush_low_digest_if_due():
+    now_kst = datetime.datetime.now(KST)
+    today = now_kst.strftime("%Y-%m-%d")
+
+    queue_data = load_low_queue()
+    items = queue_data.get("items", [])
+    last_digest_date = queue_data.get("last_digest_date")
+
+    if not items:
+        return
+
+    # 하루 1회, KST 18시 이후 발송
+    if now_kst.hour < 18 or last_digest_date == today:
+        return
+
+    digest_articles = []
+    for item in items:
+        try:
+            published_dt = parser.parse(item.get("published"))
+        except Exception:
+            published_dt = datetime.datetime.now(datetime.timezone.utc)
+
+        digest_articles.append({
+            "title": item.get("title", "(제목 없음)"),
+            "link": item.get("link", ""),
+            "published": published_dt
+        })
+
+    digest_message = format_low_digest(digest_articles)
+    if digest_message:
+        logger.info(f"Sending daily [LOW-DIGEST] for {len(digest_articles)} articles at 18:00 KST window.")
+        send_telegram_message(digest_message)
+
+    queue_data["items"] = []
+    queue_data["last_digest_date"] = today
+    save_low_queue(queue_data)
+
+
 def process_subscriber_commands():
     """Process /start, /help, /subscribe, /unsubscribe commands via Telegram getUpdates."""
     if not TELEGRAM_BOT_TOKEN:
@@ -208,7 +296,7 @@ def process_subscriber_commands():
                 "/help : 명령어 안내 보기\n\n"
                 "알림 정책:\n"
                 "- 🔴/🟡 중요 뉴스는 개별 알림\n"
-                "- ⚪ 낮은 중요도 뉴스는 묶음 요약으로 발송"
+                "- ⚪ 낮은 중요도 뉴스는 매일 18:00(KST) 묶음 요약 발송"
             )
             logger.info(f"Help requested: {chat_id_str}")
 
@@ -506,10 +594,10 @@ def run_news_cycle():
         sent_stats[importance] = sent_stats.get(importance, 0) + 1
 
     if low_bucket:
-        digest = format_low_digest(low_bucket)
-        if digest:
-            logger.info(f"Sending [LOW-DIGEST] merged message for {len(low_bucket)} low-importance articles.")
-            send_telegram_message(digest)
+        enqueue_low_articles(low_bucket)
+        logger.info(f"Queued {len(low_bucket)} low-importance articles for 18:00 KST digest.")
+
+    flush_low_digest_if_due()
 
     logger.info(
         f"Cycle finished. Sent {match_count} new articles "
@@ -534,6 +622,7 @@ def run_command_loop(interval_seconds: int):
     while True:
         try:
             process_subscriber_commands()
+            flush_low_digest_if_due()
         except Exception as e:
             logger.error(f"Unexpected error in command loop: {e}")
 
