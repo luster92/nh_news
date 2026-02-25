@@ -80,6 +80,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUBSCRIBERS_FILE = "subscribers.json"
 TELEGRAM_STATE_FILE = "telegram_state.json"
 LOW_QUEUE_FILE = "low_importance_queue.json"
+LAST_BROADCAST_FILE = "last_broadcast_message.json"
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 if GEMINI_API_KEY:
@@ -154,6 +155,32 @@ def send_telegram_reply(chat_id, message):
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         logger.error(f"Error sending command reply to {chat_id}: {e}")
+
+
+def load_last_broadcast_message():
+    if not os.path.exists(LAST_BROADCAST_FILE):
+        return None
+    try:
+        with open(LAST_BROADCAST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not data.get("message"):
+                return None
+            return data
+    except Exception as e:
+        logger.error(f"Failed to load last broadcast message: {e}")
+        return None
+
+
+def save_last_broadcast_message(message):
+    try:
+        payload = {
+            "message": message,
+            "saved_at": datetime.datetime.now(KST).isoformat()
+        }
+        with open(LAST_BROADCAST_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save last broadcast message: {e}")
 
 
 def load_low_queue():
@@ -294,6 +321,20 @@ def process_subscriber_commands():
                 chat_id,
                 "✅ NH_news 구독이 시작되었습니다.\n이제 농협은행 관련 뉴스를 받아보실 수 있습니다.\n중단하려면 /unsubscribe 를 입력하세요."
             )
+
+            # 새 구독자에게 최근 발송 뉴스 샘플 1건 제공
+            last_sample = load_last_broadcast_message()
+            if last_sample:
+                saved_at = last_sample.get("saved_at", "시간 정보 없음")
+                sample_msg = (
+                    "📰 최근 발송 뉴스 샘플입니다.\n"
+                    f"(기준 시각: {saved_at})\n\n"
+                    f"{last_sample.get('message', '')}"
+                )
+                send_telegram_reply(chat_id, sample_msg)
+            else:
+                send_telegram_reply(chat_id, "🗂 아직 발송 이력이 없어 샘플 뉴스가 없습니다. 곧 첫 알림을 보내드릴게요!")
+
             logger.info(f"Subscriber added: {chat_id_str}")
 
         elif text.startswith("/help"):
@@ -599,6 +640,9 @@ def send_telegram_message(message):
             logger.error(f"Error sending message to {chat_id}: {e}")
 
     logger.info(f"Message broadcast complete. Success: {success}/{len(subscribers)}")
+
+    if success > 0:
+        save_last_broadcast_message(message)
 
 def run_news_cycle():
     logger.info("Starting news fetch cycle.")
