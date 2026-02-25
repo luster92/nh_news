@@ -82,6 +82,7 @@ TELEGRAM_STATE_FILE = "telegram_state.json"
 LOW_QUEUE_FILE = "low_importance_queue.json"
 LAST_BROADCAST_FILE = "last_broadcast_message.json"
 KST = datetime.timezone(datetime.timedelta(hours=9))
+DIGEST_LOCK = threading.Lock()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -233,42 +234,44 @@ def enqueue_low_articles(articles):
 
 
 def flush_low_digest_if_due():
-    now_kst = datetime.datetime.now(KST)
-    today = now_kst.strftime("%Y-%m-%d")
+    # news loop / command loop 동시 호출 시 중복 발송 방지
+    with DIGEST_LOCK:
+        now_kst = datetime.datetime.now(KST)
+        today = now_kst.strftime("%Y-%m-%d")
 
-    queue_data = load_low_queue()
-    items = queue_data.get("items", [])
-    last_digest_date = queue_data.get("last_digest_date")
+        queue_data = load_low_queue()
+        items = queue_data.get("items", [])
+        last_digest_date = queue_data.get("last_digest_date")
 
-    if not items:
-        return
+        if not items:
+            return
 
-    # 하루 1회, KST 18시 이후 발송
-    if now_kst.hour < 18 or last_digest_date == today:
-        return
+        # 하루 1회, KST 18시 이후 발송
+        if now_kst.hour < 18 or last_digest_date == today:
+            return
 
-    digest_articles = []
-    for item in items:
-        try:
-            published_dt = parser.parse(item.get("published"))
-        except Exception:
-            published_dt = datetime.datetime.now(datetime.timezone.utc)
+        digest_articles = []
+        for item in items:
+            try:
+                published_dt = parser.parse(item.get("published"))
+            except Exception:
+                published_dt = datetime.datetime.now(datetime.timezone.utc)
 
-        digest_articles.append({
-            "title": item.get("title", "(제목 없음)"),
-            "link": item.get("link", ""),
-            "published": published_dt,
-            "importance": item.get("importance", "LOW")
-        })
+            digest_articles.append({
+                "title": item.get("title", "(제목 없음)"),
+                "link": item.get("link", ""),
+                "published": published_dt,
+                "importance": item.get("importance", "LOW")
+            })
 
-    digest_message = format_low_digest(digest_articles)
-    if digest_message:
-        logger.info(f"Sending daily [LOW-DIGEST] for {len(digest_articles)} articles at 18:00 KST window.")
-        send_telegram_message(digest_message)
+        digest_message = format_low_digest(digest_articles)
+        if digest_message:
+            logger.info(f"Sending daily [LOW-DIGEST] for {len(digest_articles)} articles at 18:00 KST window.")
+            send_telegram_message(digest_message)
 
-    queue_data["items"] = []
-    queue_data["last_digest_date"] = today
-    save_low_queue(queue_data)
+        queue_data["items"] = []
+        queue_data["last_digest_date"] = today
+        save_low_queue(queue_data)
 
 
 def process_subscriber_commands():
