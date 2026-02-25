@@ -605,7 +605,7 @@ def format_low_digest(articles):
             imp = article.get("importance", "LOW")
             imp_badge = "🟡" if imp == "MEDIUM" else "⚪"
             lines.append(f"- {imp_badge} {article['title']} ({date_str})")
-            lines.append(f"  🔗 {article['link']}")
+            lines.append(f"  🔗 [기사원문 읽기]({article['link']})")
             shown += 1
 
         if shown >= max_items:
