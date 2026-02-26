@@ -266,7 +266,7 @@ def flush_low_digest_if_due():
 
         digest_message = format_low_digest(digest_articles)
         if digest_message:
-            logger.info(f"Sending daily [LOW-DIGEST] for {len(digest_articles)} articles at 18:00 KST window.")
+            logger.info(f"Sending daily [MEDIUM+LOW-DIGEST] for {len(digest_articles)} articles at 18:00 KST window.")
             send_telegram_message(digest_message)
 
         queue_data["items"] = []
