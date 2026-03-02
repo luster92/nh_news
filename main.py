@@ -84,6 +84,12 @@ LAST_BROADCAST_FILE = "last_broadcast_message.json"
 KST = datetime.timezone(datetime.timedelta(hours=9))
 DIGEST_LOCK = threading.Lock()
 
+# Freshness guards
+HIGH_NEWS_MAX_AGE_HOURS = 2
+DEFAULT_NEWS_MAX_AGE_HOURS = 24
+QUEUE_MAX_AGE_HOURS = 24
+FUTURE_TOLERANCE_MINUTES = 10
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     # Using gemini-3-flash-preview as requested
@@ -207,11 +213,49 @@ def save_low_queue(queue_data):
         logger.error(f"Failed to save low queue: {e}")
 
 
+def _parse_as_utc(dt_like):
+    try:
+        parsed = parser.parse(dt_like) if isinstance(dt_like, str) else dt_like
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def prune_stale_queue_items(queue_data):
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    max_age = datetime.timedelta(hours=QUEUE_MAX_AGE_HOURS)
+    future_tolerance = datetime.timedelta(minutes=FUTURE_TOLERANCE_MINUTES)
+
+    kept = []
+    dropped = 0
+    for item in queue_data.get("items", []):
+        published_dt = _parse_as_utc(item.get("published"))
+        if not published_dt:
+            dropped += 1
+            continue
+
+        age = now_utc - published_dt
+        if age > max_age or age < -future_tolerance:
+            dropped += 1
+            continue
+
+        item["published"] = published_dt.isoformat()
+        kept.append(item)
+
+    if dropped:
+        logger.info(f"Pruned {dropped} stale/invalid queued digest items.")
+
+    queue_data["items"] = kept
+    return queue_data
+
+
 def enqueue_low_articles(articles):
     if not articles:
         return
 
-    queue_data = load_low_queue()
+    queue_data = prune_stale_queue_items(load_low_queue())
     existing_links = {item.get("link") for item in queue_data.get("items", [])}
 
     for article in articles:
@@ -239,7 +283,8 @@ def flush_low_digest_if_due():
         now_kst = datetime.datetime.now(KST)
         today = now_kst.strftime("%Y-%m-%d")
 
-        queue_data = load_low_queue()
+        queue_data = prune_stale_queue_items(load_low_queue())
+        save_low_queue(queue_data)
         items = queue_data.get("items", [])
         last_digest_date = queue_data.get("last_digest_date")
 
@@ -483,8 +528,9 @@ def fetch_news():
     filtered_articles = []
 
     current_time = datetime.datetime.now(datetime.timezone.utc)
-    default_time_limit = datetime.timedelta(hours=24)
-    high_time_limit = datetime.timedelta(hours=2)  # 갑각마스터님 요청: HIGH는 2시간 이내만
+    default_time_limit = datetime.timedelta(hours=DEFAULT_NEWS_MAX_AGE_HOURS)
+    high_time_limit = datetime.timedelta(hours=HIGH_NEWS_MAX_AGE_HOURS)
+    future_tolerance = datetime.timedelta(minutes=FUTURE_TOLERANCE_MINUTES)
 
     logger.info(f"Fetching news from: {RSS_URL}")
     logger.info(f"Found {len(feed.entries)} entries.")
@@ -497,8 +543,15 @@ def fetch_news():
 
         try:
             published_dt = parser.parse(published)
+            if published_dt.tzinfo is None:
+                published_dt = published_dt.replace(tzinfo=datetime.timezone.utc)
+            published_dt = published_dt.astimezone(datetime.timezone.utc)
         except Exception as e:
             logger.error(f"Error parsing date {published}: {e}")
+            continue
+
+        # Skip suspicious future timestamps (clock skew / bad feed metadata)
+        if (published_dt - current_time) > future_tolerance:
             continue
 
         is_target_media = False
